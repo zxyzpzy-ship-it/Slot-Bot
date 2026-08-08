@@ -1,1 +1,5 @@
 discord.py
+aiohttp
+requests
+python-dotenv
+colorama
