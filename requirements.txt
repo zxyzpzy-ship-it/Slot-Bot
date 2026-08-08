@@ -1,5 +1,2 @@
-discord.py
-aiohttp
-requests
-python-dotenv
-colorama
+discord.py>=2.6.3,<3.0.0
+tzdata>=2025.2
