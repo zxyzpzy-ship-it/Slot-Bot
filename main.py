@@ -1,393 +1,671 @@
 import os
-import discord 
-from discord.ext import commands , tasks
+import discord
+from discord.ext import commands, tasks
 import datetime
 import json
-from colorama import Fore
-intents = discord.Intents().all()
-bot = commands.Bot(command_prefix=',', intents = intents)
+
+# =========================
+# BOT SETUP
+# =========================
+
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix=",", intents=intents)
 bot.remove_command("help")
 
 
+# =========================
+# CONFIG
+# =========================
+
+with open("config.json", "r") as file:
+    hmm = json.load(file)
+
+GUILD_ID = int(hmm["guildid"])
+CATEGORY_ID = int(hmm["categoryid"])
+
+# Staff role - can manage everything
+STAFF_ROLE_ID = 1535194766004846693
+
+# Slot owner roles
+PREMIUM_ROLE_ID = 1535194940982820904
+STANDARD_ROLE_ID = 1535195023983910942
+
+
+# =========================
+# HELPERS
+# =========================
+
+def load_data():
+    try:
+        with open("data.json", "r") as file:
+            return json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_data(data):
+    with open("data.json", "w") as file:
+        json.dump(data, file, indent=4)
+
+
+def get_role(guild, role_id):
+    return guild.get_role(role_id)
+
+
+def get_slot_role(guild, slot_type):
+    slot_type = slot_type.lower()
+
+    if slot_type == "premium":
+        return get_role(guild, PREMIUM_ROLE_ID)
+
+    if slot_type == "standard":
+        return get_role(guild, STANDARD_ROLE_ID)
+
+    return None
+
+
+async def give_slot_role(member, slot_type):
+    guild = member.guild
+
+    premium_role = get_role(guild, PREMIUM_ROLE_ID)
+    standard_role = get_role(guild, STANDARD_ROLE_ID)
+
+    # Remove both first so a user cannot accidentally have both
+    if premium_role and premium_role in member.roles:
+        await member.remove_roles(premium_role)
+
+    if standard_role and standard_role in member.roles:
+        await member.remove_roles(standard_role)
+
+    role = get_slot_role(guild, slot_type)
+
+    if role:
+        await member.add_roles(role)
+
+    return role
+
+
+async def remove_slot_roles(member):
+    premium_role = get_role(member.guild, PREMIUM_ROLE_ID)
+    standard_role = get_role(member.guild, STANDARD_ROLE_ID)
+
+    roles = []
+
+    if premium_role and premium_role in member.roles:
+        roles.append(premium_role)
+
+    if standard_role and standard_role in member.roles:
+        roles.append(standard_role)
+
+    if roles:
+        await member.remove_roles(*roles)
+
+
+def calculate_end_time(amount, unit):
+    now = datetime.datetime.now().timestamp()
+
+    unit = unit.lower()
+
+    if unit == "d":
+        return now + (amount * 24 * 60 * 60)
+
+    if unit == "m":
+        return now + (amount * 30 * 24 * 60 * 60)
+
+    return None
+
+
+# =========================
+# READY
+# =========================
+
 @bot.event
 async def on_ready():
-    print(f"{bot.user.name} is Ready")
-    await expire()
-                            
-with open("config.json", "r") as file:
-        hmm = json.load(file)
+    print(f"{bot.user} is Ready")
 
-rid = hmm["premiumeroleid"]
-cid = hmm["categoryid"]
-staff = hmm["staffrole"]
-print(rid)
+    if not expire.is_running():
+        expire.start()
+
+
+# =========================
+# EXPIRE SLOTS
+# =========================
+
 @tasks.loop(hours=1)
 async def expire():
-    try:
-        with open("data.json", "r") as file:
-            data = json.load(file)
-    except FileNotFoundError:
-        data = []
 
-    nowtime = datetime.datetime.now()
-    nt = nowtime.strftime("%Y%m%d")
-    remove = []
+    data = load_data()
+    changed = False
 
-    for xd in data:
-        for item in xd:
-            slottime = item["endtime"]
-            st = datetime.datetime.fromtimestamp(int(slottime))
-            print(st.strftime("%Y%m%d"))
-            finalse = st.strftime("%Y%m%d")
-            print(f"Slot end {finalse}")
-            print(f"now time {nt}")
-            print(nt >= finalse)
+    now = datetime.datetime.now().timestamp()
 
-            if nt >= finalse:
-                
-                with open("data.json", "w") as file:
-                    json.dump(data, file, indent=4)
-                
-                channel = bot.get_channel(item["channelid"])
-                guild = bot.get_guild(int(hmm["guildid"]))
-                member = guild.get_member(item["userid"])
+    for slot in data.copy():
 
-                
+        endtime = int(slot["endtime"])
 
-                if member and channel:
-                    print(member.id)
-                    await channel.send(f"Slot expired")
-                    role = discord.utils.get(guild.roles, id=rid)
-                    print(role)
-                    await member.remove_roles(role)
-                    await channel.set_permissions(member, send_messages=False)
-                    print(xd)
-                    data.remove(xd)
-                    with open("./data.json","w") as nice:
-                        json.dump(data, nice,indent=4)
+        if now >= endtime:
 
+            guild = bot.get_guild(GUILD_ID)
 
+            if not guild:
+                continue
 
-@bot.event
-async def on_message(message):
-    await bot.process_commands(message)
-    category = discord.utils.get(message.guild.categories, id=int(cid))
-    if category:
-        if "@here" in message.content:
-            try:
-                with open("pingcount.json", "r") as file:
-                    data = json.load(file)
-            except FileNotFoundError:
-                data = []
+            channel = bot.get_channel(int(slot["channelid"]))
+            member = guild.get_member(int(slot["userid"]))
 
-            print(message.channel.id)
-            print(data)     
-            nice = False      
-            if not data:
-                dataz = {
-                    "channelid": message.channel.id,
-                    "time": datetime.datetime.now().timestamp(),
-                    "count": 2
-                }
-                data.append(dataz)
-                with open("pingcount.json", "w") as file:
-                    json.dump(data, file, indent=4)
-                    await message.channel.send("1/2")
-                    return
-            for c in data:
-                print(c)
-                if message.channel.id == c["channelid"]:
-                    nice = True
-                    print(c["time"])
-                    print(datetime.datetime.now().timestamp())
-                    nowt = datetime.datetime.now().timestamp()
-                    slotdata = int(c["time"])
-                    print(slotdata)
-                    sl = datetime.datetime.fromtimestamp(slotdata)
-                    slot = sl.strftime("%Y%m%d")
-                    cx = datetime.datetime.now()
-                    print(cx.timestamp())
-                    nowtime = cx.strftime("%Y%m%d")
-                    
+            if member:
 
-                    if slot == nowtime:
-                        xxx = c["count"]
-                        if c["count"] >= 3:
-                            channel = bot.get_channel(c["channelid"])
-                            await channel.set_permissions(message.author, send_messages=False)
-                            await message.channel.send("3/2 Slot Revoked <@&your staff role id>\n**Reason:** 3 here ping")
-                            return
-                        c["count"] = c["count"] + 1
-                        await message.channel.send(f"{xxx}/{xxx}")
-                        with open("pingcount.json", "w") as file:
-                            json.dump(data, file, indent=4)
-                        return
-                    else:
-                        c["time"] = datetime.datetime.now().timestamp()
-                        c["count"] = 2
-                        with open("pingcount.json", "w") as file:
-                            json.dump(data, file, indent=4)
-                        await message.channel.send("1/2")
-            if not nice:
-                datazx = {
-                    "channelid": message.channel.id,
-                    "time": datetime.datetime.now().timestamp(),
-                    "count": 2
-                }
-                data.append(datazx)
-                with open("pingcount.json", "w") as file:
-                    json.dump(data, file, indent=4)
-                    await message.channel.send("1/2")
+                await remove_slot_roles(member)
 
-            
+            if channel:
+
+                try:
+                    await channel.send("⏰ **Slot expired.**")
+                except:
+                    pass
+
+                if member:
+                    try:
+                        await channel.set_permissions(
+                            member,
+                            send_messages=False
+                        )
+                    except:
+                        pass
+
+            data.remove(slot)
+            changed = True
+
+    if changed:
+        save_data(data)
 
 
+# =========================
+# HELP
+# =========================
 
-   
 @bot.command()
 async def help(ctx):
-    embed = discord.Embed(description="**,create** - Use To Create Slot\n**,add** - Use To Add User In Slot\n**,remove** - Use To Remove User In SLot\n**,renew** - Use To Renew Slot",color=0xFFFF00)
-    embed.set_thumbnail(url=ctx.guild.icon)
-    embed.set_author(name="Slot Bot Help Menu")
-    await ctx.send(embed=embed,delete_after=30)
- 
-@bot.command()
-@commands.has_role(int(staff))
-async def add(ctx,member: discord.Member=None, channel: discord.TextChannel = None):
 
-    rr = []
+    embed = discord.Embed(
+        title="Slot Bot Help",
+        description=(
+            "`,create @user 30 d premium`\n"
+            "Create a premium slot.\n\n"
 
-    with open("./data.json","r") as rr:
-        rr = json.load(rr)
+            "`,create @user 30 d standard`\n"
+            "Create a standard slot.\n\n"
 
-    ftf = False
+            "`,add @user #channel`\n"
+            "Add a user to a slot.\n\n"
 
-    for x in rr:
-        for xx in x:
-            if (xx["channelid"] == channel.id):
-                ftf = True
+            "`,remove @user #channel`\n"
+            "Remove slot permissions.\n\n"
 
-    if (ftf == False):
-        await ctx.send("Slot Not In DataBase")
-        return
+            "`,renew @user #channel 30 d premium`\n"
+            "Renew a slot.\n\n"
 
-                
+            "`,revoke @user #channel`\n"
+            "Revoke a slot."
+        ),
+        color=0xFFFF00
+    )
 
-                
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
 
-    
-    if (member == False):
-        await ctx.reply("Member Not Found")
+    await ctx.send(embed=embed, delete_after=30)
 
-    if (channel == False):
-        await ctx.reply("Channel Not Found")
 
-    await channel.set_permissions(member,view_channel=True, send_messages=True,mention_everyone=True)
-    await ctx.reply("successfully Added")
+# =========================
+# ADD
+# =========================
 
 @bot.command()
-@commands.has_role(int(staff))
-async def renew(ctx,member: discord.Member = None,channel: discord.TextChannel=None,yoyo: int = None,cx=None):
-     
+@commands.has_role(STAFF_ROLE_ID)
+async def add(
+    ctx,
+    member: discord.Member = None,
+    channel: discord.TextChannel = None
+):
 
-    rr = []
-
-    with open("./data.json","r") as rr:
-        rr = json.load(rr)
-
-    ftf = False
-
-    for x in rr:
-        for xx in x:
-            if (xx["channelid"] == channel.id):
-                ftf = True
-
-    if (ftf == False):
-        await ctx.send("Slot Not In DataBase")
-        return
-                
-    print("ru")
-    if (member == None):
-        await ctx.reply("Member Not Found")
+    if member is None:
+        await ctx.reply("❌ Member not found.")
         return
 
-    if (channel == None):
-        await ctx.reply("Channel Not Found")
+    if channel is None:
+        await ctx.reply("❌ Channel not found.")
         return
 
-    if (cx.lower() == "d"):
-         yoyo = (yoyo * 24 * 60 * 60) + datetime.datetime.now().timestamp()
-    elif (cx.lower() == "m"):
-         yoyo = (yoyo * 30 * 24 * 60 * 60) + datetime.datetime.now().timestamp()
-    else:
-         await ctx.reply("Use valid Formate: ,add @user 1 m his Slot")
+    data = load_data()
 
-    await channel.set_permissions(member,view_channel=True,send_messages=True,mention_everyone=True)
-    role = discord.utils.get(ctx.guild.roles, id=int(rid))
-    await member.add_roles(role)
-    print("ruw")
-    async for message in channel.history(limit=1000):
-        await message.delete()
-    dataz = {
-         "endtime": yoyo,
-         "userid": member.id,
-         "channelid": channel.id
-         },
-    try:
-        with open("data.json", "r") as file:
-            data = json.load(file)
-    except FileNotFoundError:
-        data = []
-        data.append(dataz)
-        with open("data.json", "w") as file:
-            json.dump(data, file,indent=4)
-     
-    embed = discord.Embed(description="""Your Slot Rules""",color=0xFFFF00)
+    slot_exists = any(
+        int(slot["channelid"]) == channel.id
+        for slot in data
+    )
 
-    embed.set_author(name="Slot Rules")
-    embed.set_thumbnail(url=f"{ctx.guild.icon}")
+    if not slot_exists:
+        await ctx.reply("❌ Slot not found in database.")
+        return
 
-    await channel.send(embed=embed)
-    embed = discord.Embed(description=f'**Slot Owner:** {member.mention}\n**End:** <t:{int(yoyo)}:R>',color=0xFFFF00)
-    embed.set_footer(text=ctx.guild.name)
-    embed.set_author(name=member)
-    await channel.send(embed=embed)
-    await ctx.reply(f"successfully renew Slot {channel.mention}")
+    await channel.set_permissions(
+        member,
+        view_channel=True,
+        send_messages=True,
+        mention_everyone=True
+    )
 
+    await ctx.reply(
+        f"✅ Successfully added {member.mention} to {channel.mention}"
+    )
+
+
+# =========================
+# REMOVE
+# =========================
 
 @bot.command()
-@commands.has_role(int(staff))
-async def remove(ctx,member: discord.Member=None, channel: discord.TextChannel = None):
+@commands.has_role(STAFF_ROLE_ID)
+async def remove(
+    ctx,
+    member: discord.Member = None,
+    channel: discord.TextChannel = None
+):
 
-    rr = []
-
-    with open("./data.json","r") as rr:
-        rr = json.load(rr)
-
-    ftf = False
-
-    for x in rr:
-        for xx in x:
-            if (xx["channelid"] == channel.id):
-                ftf = True
-
-    if (ftf == False):
-        await ctx.send("Slot Not In DataBase")
+    if member is None:
+        await ctx.reply("❌ Member not found.")
         return
 
-    if (member == False):
-        await ctx.reply("Member Not Found")
+    if channel is None:
+        await ctx.reply("❌ Channel not found.")
+        return
 
-    if (channel == False):
-        await ctx.reply("Channel Not Found")
+    data = load_data()
 
-    await channel.set_permissions(member, send_messages=True,mention_everyone=False)
-    await ctx.reply("successfully removed")
+    slot_exists = any(
+        int(slot["channelid"]) == channel.id
+        for slot in data
+    )
 
+    if not slot_exists:
+        await ctx.reply("❌ Slot not found in database.")
+        return
+
+    await channel.set_permissions(
+        member,
+        send_messages=False,
+        mention_everyone=False
+    )
+
+    await ctx.reply(
+        f"✅ Removed {member.mention} from {channel.mention}"
+    )
+
+
+# =========================
+# REVOKE
+# =========================
 
 @bot.command()
-@commands.has_role(int(staff))
-async def revoke(ctx,member: discord.Member=None, channel: discord.TextChannel = None):
+@commands.has_role(STAFF_ROLE_ID)
+async def revoke(
+    ctx,
+    member: discord.Member = None,
+    channel: discord.TextChannel = None
+):
 
-    rr = []
-
-    with open("./data.json","r") as rr:
-        rr = json.load(rr)
-
-    ftf = False
-
-    for x in rr:
-        for xx in x:
-            if (xx["channelid"] == channel.id):
-                ftf = True
-
-    if (ftf == False):
-        await ctx.send("Slot Not In DataBase")
+    if member is None:
+        await ctx.reply("❌ Member not found.")
         return
 
-    if (member == False):
-        await ctx.reply("Member Not Found")
+    if channel is None:
+        await ctx.reply("❌ Channel not found.")
+        return
 
-    if (channel == False):
-        await ctx.reply("Channel Not Found")
+    data = load_data()
 
-    await channel.set_permissions(member, send_messages=True,mention_everyone=False)
-    await ctx.reply("successfully removed")
+    slot_exists = any(
+        int(slot["channelid"]) == channel.id
+        for slot in data
+    )
+
+    if not slot_exists:
+        await ctx.reply("❌ Slot not found in database.")
+        return
+
+    await channel.set_permissions(
+        member,
+        send_messages=False,
+        mention_everyone=False
+    )
+
+    await remove_slot_roles(member)
+
+    await ctx.reply(
+        f"🚫 Slot revoked for {member.mention}"
+    )
 
 
+# =========================
+# CREATE
+# =========================
 
 @bot.command()
-@commands.has_role(int(staff))
-async def create(ctx,member: discord.Member=None,yoyo: int = None,cx=None,*,x=None):
+@commands.has_role(STAFF_ROLE_ID)
+async def create(
+    ctx,
+    member: discord.Member = None,
+    amount: int = None,
+    unit: str = None,
+    slot_type: str = None,
+    *,
+    channel_name: str = None
+):
 
-    if member == None:
-        await ctx.reply("User Not Found")
+    if member is None:
+        await ctx.reply("❌ User not found.")
         return
 
-    if yoyo == None:
-        await ctx.reply("Use valid Formate: ,add @user 1 m his Slot")
-        return
-    
-    if cx == None:
-        await ctx.reply("Use valid Formate: ,add @user 1 m his Slot")
+    if amount is None:
+        await ctx.reply("❌ Enter slot duration.")
         return
 
-    
-    if (x == None):
-        x = member.display_name
+    if amount <= 0:
+        await ctx.reply("❌ Duration must be greater than 0.")
+        return
+
+    if unit is None:
+        await ctx.reply("❌ Use `d` for days or `m` for months.")
+        return
+
+    if slot_type is None:
+        await ctx.reply(
+            "❌ Slot type required.\n"
+            "Use `premium` or `standard`."
+        )
+        return
+
+    slot_type = slot_type.lower()
+
+    if slot_type not in ["premium", "standard"]:
+        await ctx.reply(
+            "❌ Invalid slot type.\n"
+            "Use `premium` or `standard`."
+        )
+        return
+
+    endtime = calculate_end_time(amount, unit)
+
+    if endtime is None:
+        await ctx.reply(
+            "❌ Invalid duration.\n"
+            "Use `d` for days or `m` for months."
+        )
+        return
+
+    # =========================
+    # CHANNEL
+    # =========================
+
+    if channel_name is None:
+        channel_name = member.display_name
+
+    category = ctx.guild.get_channel(CATEGORY_ID)
+
+    if category is None or not isinstance(
+        category,
+        discord.CategoryChannel
+    ):
+        await ctx.reply("❌ Slot category not found.")
+        return
 
     overwrites = {
-    ctx.guild.default_role: discord.PermissionOverwrite(view_channel=True,send_messages=False),
-    member: discord.PermissionOverwrite(view_channel=True,send_messages=True,mention_everyone=True)
-}
-    
-    
 
-    category = discord.utils.get(ctx.guild.categories, id=int(cid))
+        ctx.guild.default_role:
+            discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=False
+            ),
 
-    a = await ctx.guild.create_text_channel(x,category=category,overwrites=overwrites)
+        member:
+            discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                mention_everyone=True
+            )
+    }
 
-    await a.set_permissions(ctx.guild.default_role, send_messages=False)
-    role = discord.utils.get(ctx.author.guild.roles, id=int(rid))
-    await member.add_roles(role)
+    channel = await ctx.guild.create_text_channel(
+        channel_name,
+        category=category,
+        overwrites=overwrites
+    )
 
-    embed = discord.Embed(description="""Your Slot Rules *""",color=0xFFFF00)
+    # =========================
+    # GIVE ROLE
+    # =========================
 
-    embed.set_author(name="Slot Rules")
-    embed.set_thumbnail(url=ctx.guild.icon)
+    role = await give_slot_role(member, slot_type)
 
-    await a.send(embed=embed)
+    if role is None:
+        await ctx.reply(
+            f"⚠️ Slot created, but `{slot_type}` role was not found."
+        )
 
-    if (cx.lower() == "d"):
-        yoyo = (yoyo * 24 * 60 * 60) + datetime.datetime.now().timestamp()
-    elif (cx.lower() == "m"):
-        yoyo = (yoyo * 30 * 24 * 60 * 60) + datetime.datetime.now().timestamp()
-    else:
-        await ctx.reply("Use valid Formate: ,add @user 1 m his Slot")
-        
-    embed = discord.Embed(description=f'**Slot Owner:** {member.mention}\n**End:** <t:{int(yoyo)}:R>',color=0xFFFF00)
+    # =========================
+    # RULES EMBED
+    # =========================
+
+    embed = discord.Embed(
+        title="Slot Rules",
+        description="Your Slot Rules *",
+        color=0xFFFF00
+    )
+
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+
+    await channel.send(embed=embed)
+
+    # =========================
+    # SLOT INFO
+    # =========================
+
+    embed = discord.Embed(
+        description=(
+            f"**Slot Owner:** {member.mention}\n"
+            f"**Type:** {slot_type.title()}\n"
+            f"**End:** <t:{int(endtime)}:R>"
+        ),
+        color=0xFFFF00
+    )
+
     embed.set_footer(text=ctx.guild.name)
-    embed.set_author(name=member)
-    await a.send(embed=embed)
-    await ctx.reply(f"successfully Create Slot {a.mention}")
-    dataz = {
-        "endtime": yoyo,
+    embed.set_author(name=member.display_name)
+
+    await channel.send(embed=embed)
+
+    # =========================
+    # DATABASE
+    # =========================
+
+    data = load_data()
+
+    data.append({
+        "endtime": endtime,
         "userid": member.id,
-        "channelid": a.id
-    },
+        "channelid": channel.id,
+        "type": slot_type
+    })
+
+    save_data(data)
+
+    await ctx.reply(
+        f"✅ Successfully created {slot_type.title()} slot "
+        f"{channel.mention}"
+    )
+
+
+# =========================
+# RENEW
+# =========================
+
+@bot.command()
+@commands.has_role(STAFF_ROLE_ID)
+async def renew(
+    ctx,
+    member: discord.Member = None,
+    channel: discord.TextChannel = None,
+    amount: int = None,
+    unit: str = None,
+    slot_type: str = None
+):
+
+    if member is None:
+        await ctx.reply("❌ Member not found.")
+        return
+
+    if channel is None:
+        await ctx.reply("❌ Channel not found.")
+        return
+
+    if amount is None:
+        await ctx.reply("❌ Duration missing.")
+        return
+
+    if unit is None:
+        await ctx.reply("❌ Use `d` or `m`.")
+        return
+
+    if slot_type is None:
+        await ctx.reply(
+            "❌ Slot type required: `premium` or `standard`."
+        )
+        return
+
+    slot_type = slot_type.lower()
+
+    if slot_type not in ["premium", "standard"]:
+        await ctx.reply(
+            "❌ Invalid slot type."
+        )
+        return
+
+    endtime = calculate_end_time(amount, unit)
+
+    if endtime is None:
+        await ctx.reply(
+            "❌ Invalid duration. Use `d` or `m`."
+        )
+        return
+
+    data = load_data()
+
+    slot = None
+
+    for item in data:
+        if int(item["channelid"]) == channel.id:
+            slot = item
+            break
+
+    if slot is None:
+        await ctx.reply("❌ Slot not found in database.")
+        return
+
+    # Update database
+    slot["endtime"] = endtime
+    slot["userid"] = member.id
+    slot["type"] = slot_type
+
+    save_data(data)
+
+    # Permissions
+    await channel.set_permissions(
+        member,
+        view_channel=True,
+        send_messages=True,
+        mention_everyone=True
+    )
+
+    # Update role
+    await give_slot_role(member, slot_type)
+
+    # Delete old messages
     try:
-        with open("data.json", "r") as file:
-            data = json.load(file)
-    except FileNotFoundError:
-        data = []
-    data.append(dataz)
-   
-    with open("data.json", "w") as file:
-        json.dump(data, file,indent=4)
-  
+        await channel.purge(limit=1000)
+    except:
+        pass
+
+    # Rules
+    embed = discord.Embed(
+        title="Slot Rules",
+        description="Your Slot Rules",
+        color=0xFFFF00
+    )
+
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+
+    await channel.send(embed=embed)
+
+    # Slot info
+    embed = discord.Embed(
+        description=(
+            f"**Slot Owner:** {member.mention}\n"
+            f"**Type:** {slot_type.title()}\n"
+            f"**End:** <t:{int(endtime)}:R>"
+        ),
+        color=0xFFFF00
+    )
+
+    embed.set_footer(text=ctx.guild.name)
+    embed.set_author(name=member.display_name)
+
+    await channel.send(embed=embed)
+
+    await ctx.reply(
+        f"✅ Successfully renewed {channel.mention} "
+        f"as **{slot_type.title()}**"
+    )
+
+
+# =========================
+# ERROR HANDLER
+# =========================
+
+@bot.event
+async def on_command_error(ctx, error):
+
+    if isinstance(error, commands.MissingRole):
+        await ctx.reply(
+            "❌ You don't have the required **Staff** role."
+        )
+        return
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(
+            "❌ Missing argument. Use `,help` to see the commands."
+        )
+        return
+
+    if isinstance(error, commands.BadArgument):
+        await ctx.reply(
+            "❌ Invalid argument. Check the user/channel and try again."
+        )
+        return
+
+    print(f"Command Error: {error}")
+
+
+# =========================
+# TOKEN
+# =========================
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN environment variable is missing")
+    raise RuntimeError(
+        "DISCORD_TOKEN environment variable is missing"
+    )
 
 bot.run(TOKEN)
