@@ -1,8 +1,8 @@
+import os
 import discord 
 from discord.ext import commands , tasks
 import datetime
 import json
-import os
 from colorama import Fore
 intents = discord.Intents().all()
 bot = commands.Bot(command_prefix=',', intents = intents)
