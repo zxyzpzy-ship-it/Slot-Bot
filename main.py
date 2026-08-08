@@ -1,8 +1,8 @@
 import os
-import json
+import re
+import sqlite3
 import asyncio
-import datetime
-from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
@@ -10,1524 +10,1342 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ============================================================
+# CUPIC SLOTS
+# main.py
+# ============================================================
 
-CONFIG_FILE = Path("config.json")
-DATA_FILE = Path("slots.json")
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 
-IST = ZoneInfo("Asia/Kolkata")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN environment variable is missing")
 
+try:
+    GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW else 0
+except ValueError:
+    raise RuntimeError("GUILD_ID must be a valid Discord server ID")
+
+# Fixed roles requested for this bot.
 STAFF_ROLE_ID = 1535194766004846693
 PREMIUM_ROLE_ID = 1535194940982820904
 STANDARD_ROLE_ID = 1535195023983910942
 
-FOOTER = "Cupic Bot"
+DB_FILE = "cupic_slots.db"
+IST = ZoneInfo("Asia/Kolkata")
 
-# Change these if you want different colors.
-EMBED_COLOR = 0x5865F2
-SUCCESS_COLOR = 0x57F287
-WARNING_COLOR = 0xFEE75C
-ERROR_COLOR = 0xED4245
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.messages = True
+intents.message_content = True
 
 
-# =========================================================
-# CONFIG FILE
-# =========================================================
+# ============================================================
+# DATABASE
+# ============================================================
 
-def load_config():
-    if not CONFIG_FILE.exists():
-        raise RuntimeError(
-            "config.json is missing. Create it with your guildid."
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("PRAGMA foreign_keys=ON")
+
+db.execute(
+    """
+    CREATE TABLE IF NOT EXISTS slots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        channel_id INTEGER NOT NULL UNIQUE,
+        owner_id INTEGER NOT NULL,
+        slot_name TEXT NOT NULL,
+        slot_type TEXT NOT NULL,
+        category_id INTEGER NOT NULL,
+        created_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        duration_value INTEGER NOT NULL,
+        duration_unit TEXT NOT NULL,
+        here_limit INTEGER NOT NULL DEFAULT 0,
+        everyone_limit INTEGER NOT NULL DEFAULT 0,
+        here_count INTEGER NOT NULL DEFAULT 0,
+        everyone_count INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        last_reset_date TEXT NOT NULL,
+        notified_24h INTEGER NOT NULL DEFAULT 0,
+        notified_1h INTEGER NOT NULL DEFAULT 0,
+        details_message_id INTEGER,
+        rules_message_id INTEGER
+    )
+    """
+)
+db.commit()
+
+
+def db_execute(query, params=(), commit=True):
+    cur = db.execute(query, params)
+    if commit:
+        db.commit()
+    return cur
+
+
+def db_one(query, params=()):
+    return db.execute(query, params).fetchone()
+
+
+def db_all(query, params=()):
+    return db.execute(query, params).fetchall()
+
+
+def get_slot(channel_id: int):
+    return db_one("SELECT * FROM slots WHERE channel_id = ?", (channel_id,))
+
+
+def get_active_slots(guild_id: int):
+    return db_all(
+        "SELECT * FROM slots WHERE guild_id = ? AND status IN ('active', 'held')",
+        (guild_id,),
+    )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_ts() -> int:
+    return int(now_utc().timestamp())
+
+
+def ist_now() -> datetime:
+    return datetime.now(IST)
+
+
+def discord_timestamp(timestamp: float) -> int:
+    return int(timestamp)
+
+
+def safe_channel_name(name: str) -> str:
+    name = name.strip().lower()
+    name = re.sub(r"[^a-z0-9\- ]+", "", name)
+    name = re.sub(r"\s+", "-", name)
+    name = re.sub(r"-+", "-", name).strip("-")
+    return (name or "slot")[:90]
+
+
+def duration_seconds(value: int, unit: str) -> int:
+    if unit == "minutes":
+        return value * 60
+    if unit == "hours":
+        return value * 60 * 60
+    if unit == "days":
+        return value * 24 * 60 * 60
+    if unit == "months":
+        return value * 30 * 24 * 60 * 60
+    if unit == "years":
+        return value * 365 * 24 * 60 * 60
+    raise ValueError("Invalid time unit")
+
+
+def duration_text(value: int, unit: str) -> str:
+    label = unit[:-1] if value == 1 and unit.endswith("s") else unit
+    return f"{value} {label.title()}"
+
+
+def role_for_type(guild: discord.Guild, slot_type: str):
+    role_id = PREMIUM_ROLE_ID if slot_type == "premium" else STANDARD_ROLE_ID
+    return guild.get_role(role_id)
+
+
+def bot_member(guild: discord.Guild):
+    return guild.me
+
+
+def is_staff(member: discord.Member) -> bool:
+    return (
+        member.guild_permissions.administrator
+        or any(role.id == STAFF_ROLE_ID for role in member.roles)
+    )
+
+
+def is_admin(member: discord.Member) -> bool:
+    return member.guild_permissions.administrator
+
+
+def can_manage_slot(member: discord.Member, slot) -> bool:
+    return is_staff(member) or member.id == int(slot["owner_id"])
+
+
+def reset_marker_for_creation() -> str:
+    """
+    A slot created before 12:00 IST should reset at today's noon.
+    A slot created after 12:00 IST should reset tomorrow.
+    """
+    current = ist_now()
+    noon = current.replace(hour=12, minute=0, second=0, microsecond=0)
+
+    if current >= noon:
+        return current.strftime("%Y-%m-%d")
+
+    return (current.date() - timedelta(days=1)).isoformat()
+
+
+def role_mention(role_id: int) -> str:
+    return f"<@&{role_id}>"
+
+
+async def get_text_channel(guild: discord.Guild, channel_id: int):
+    channel = guild.get_channel(channel_id)
+
+    if isinstance(channel, discord.TextChannel):
+        return channel
+
+    try:
+        fetched = await bot.fetch_channel(channel_id)
+        if isinstance(fetched, discord.TextChannel):
+            return fetched
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+    return None
+
+
+async def get_member(guild: discord.Guild, user_id: int):
+    member = guild.get_member(user_id)
+    if member:
+        return member
+
+    try:
+        return await guild.fetch_member(user_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+def details_embed(guild: discord.Guild, member: discord.Member, slot, *, title_override=None):
+    embed = discord.Embed(
+        title=title_override or "Cupic Slots",
+        description=(
+            "## Slot Information\n\n"
+            f"**User**\n{member.mention}\n\n"
+            f"**Slot Name**\n🌸 • {slot['slot_name']}\n\n"
+            f"**Duration**\n{duration_text(int(slot['duration_value']), slot['duration_unit'])}\n\n"
+            f"**Creation Date**\n<t:{int(slot['created_at'])}:R>\n\n"
+            f"**Expiry Date**\n<t:{int(slot['expires_at'])}:R>\n\n"
+            f"**Remaining**\n<t:{int(slot['expires_at'])}:R>\n\n"
+            f"**Ping Allowed**\n"
+            f"`@here : {int(slot['here_limit'])}`  │  "
+            f"`@everyone : {int(slot['everyone_limit'])}`\n\n"
+            "**Slot Rules**\n"
+            "📌 • Check server rules\n"
+            "📌 • Use only the allowed pings\n"
+            "📌 • No spam or misuse"
+        ),
+        color=discord.Color.from_rgb(255, 92, 172),
+    )
+
+    if guild.icon:
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text="Cupic Bot", icon_url=guild.icon.url)
+    else:
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text="Cupic Bot")
+
+    return embed
+
+
+def rules_embed(guild: discord.Guild):
+    embed = discord.Embed(
+        title="Slot Rules",
+        description=(
+            "📌 • Follow the server rules.\n"
+            "📌 • Use only your allowed `@here` and `@everyone` pings.\n"
+            "📌 • Do not spam or misuse the slot.\n"
+            "📌 • Only the slot owner may advertise in the slot.\n"
+            "📌 • Staff instructions must be followed.\n"
+            "📌 • Excessive or unauthorized pings can revoke the slot."
+        ),
+        color=discord.Color.from_rgb(255, 92, 172),
+    )
+    embed.set_footer(text="Cupic Bot")
+    return embed
+
+
+def status_embed(slot, member: discord.Member, action: str):
+    status_text = {
+        "active": "Active",
+        "held": "Held",
+        "expired": "Expired",
+        "revoked": "Revoked",
+    }.get(action, action.title())
+
+    embed = discord.Embed(
+        title="Cupic Slots",
+        description=(
+            f"**Slot:** {slot['slot_name']}\n"
+            f"**Status:** {status_text}\n"
+            f"**Type:** {slot['slot_type'].title()}\n"
+            f"**Expiry:** <t:{int(slot['expires_at'])}:R>"
+        ),
+        color=discord.Color.from_rgb(255, 92, 172),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text="Cupic Bot")
+    return embed
+
+
+def renewal_view(guild_id: int, channel_id: int):
+    view = discord.ui.View(timeout=None)
+    button = discord.ui.Button(
+        label="Click here to renew",
+        style=discord.ButtonStyle.link,
+        url=f"https://discord.com/channels/{guild_id}/{channel_id}",
+    )
+    view.add_item(button)
+    return view
+
+
+async def send_owner_dm(
+    guild: discord.Guild,
+    owner: discord.Member,
+    slot,
+    action: str,
+    reason: str,
+):
+    embed = status_embed(slot, owner, action)
+    embed.add_field(name="Reason", value=reason, inline=False)
+
+    try:
+        await owner.send(embed=embed, view=renewal_view(int(slot["guild_id"]), int(slot["channel_id"])))
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def remove_slot_role_if_unused(
+    guild: discord.Guild,
+    owner: discord.Member,
+    slot_type: str,
+    current_channel_id: int | None = None,
+):
+    role = role_for_type(guild, slot_type)
+    if not role:
+        return
+
+    if current_channel_id is None:
+        current_channel_id = -1
+
+    other = db_one(
+        """
+        SELECT 1 FROM slots
+        WHERE guild_id = ?
+          AND owner_id = ?
+          AND slot_type = ?
+          AND status IN ('active', 'held')
+          AND channel_id != ?
+        LIMIT 1
+        """,
+        (guild.id, owner.id, slot_type, current_channel_id),
+    )
+
+    if other:
+        return
+
+    try:
+        await owner.remove_roles(role, reason="Cupic Slots: no active slot of this type")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def add_slot_role(guild: discord.Guild, owner: discord.Member, slot_type: str):
+    role = role_for_type(guild, slot_type)
+    if not role:
+        return False
+
+    me = bot_member(guild)
+    if me and role >= me.top_role and not me.guild_permissions.administrator:
+        return False
+
+    try:
+        await owner.add_roles(role, reason="Cupic Slots: slot created/restored")
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
+async def set_owner_access(channel: discord.TextChannel, owner: discord.Member, allowed: bool):
+    try:
+        await channel.set_permissions(
+            owner,
+            view_channel=True,
+            send_messages=allowed,
+            mention_everyone=allowed,
+            reason="Cupic Slots owner access",
         )
-
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    if "guildid" not in config:
-        raise RuntimeError("config.json must contain 'guildid'.")
-
-    return config
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
-CONFIG = load_config()
-GUILD_ID = int(CONFIG["guildid"])
+async def refresh_details_message(guild: discord.Guild, slot):
+    channel = await get_text_channel(guild, int(slot["channel_id"]))
+    owner = await get_member(guild, int(slot["owner_id"]))
+
+    if not channel or not owner:
+        return
+
+    embed = details_embed(guild, owner, slot)
+
+    message_id = slot["details_message_id"]
+
+    if message_id:
+        try:
+            message = await channel.fetch_message(int(message_id))
+            await message.edit(embed=embed)
+            return
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    try:
+        message = await channel.send(embed=embed)
+        db_execute(
+            "UPDATE slots SET details_message_id = ? WHERE channel_id = ?",
+            (message.id, channel.id),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
-# =========================================================
+async def revoke_slot(
+    guild: discord.Guild,
+    slot,
+    *,
+    action: str,
+    reason: str,
+    delete_offending_message: discord.Message | None = None,
+):
+    if slot["status"] in ("expired", "revoked") and action in ("expired", "revoked"):
+        return
+
+    channel = await get_text_channel(guild, int(slot["channel_id"]))
+    owner = await get_member(guild, int(slot["owner_id"]))
+
+    if delete_offending_message:
+        try:
+            await delete_offending_message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    new_status = "expired" if action == "expired" else "revoked"
+
+    db_execute(
+        "UPDATE slots SET status = ? WHERE channel_id = ?",
+        (new_status, int(slot["channel_id"])),
+    )
+
+    if owner:
+        if channel:
+            await set_owner_access(channel, owner, False)
+
+        await remove_slot_role_if_unused(
+            guild,
+            owner,
+            slot["slot_type"],
+            int(slot["channel_id"]),
+        )
+        await send_owner_dm(guild, owner, slot, new_status, reason)
+
+    if channel:
+        try:
+            embed = discord.Embed(
+                title="Cupic Slots",
+                description=(
+                    f"**Slot:** {slot['slot_name']}\n"
+                    f"**Status:** {new_status.title()}\n"
+                    f"**Reason:** {reason}"
+                ),
+                color=discord.Color.from_rgb(255, 92, 172),
+            )
+            embed.set_footer(text="Cupic Bot")
+            await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+# ============================================================
 # BOT
-# =========================================================
-
-intents = discord.Intents.all()
-
+# ============================================================
 
 class CupicBot(commands.Bot):
     def __init__(self):
         super().__init__(
-            command_prefix=",",
+            command_prefix=commands.when_mentioned,
             intents=intents,
-            help_command=None
+            help_command=None,
         )
+        self.sync_done = False
 
     async def setup_hook(self):
-        # Start background tasks only once.
-        if not expiry_loop.is_running():
-            expiry_loop.start()
+        if not self.expiry_loop.is_running():
+            self.expiry_loop.start()
 
-        if not ping_reset_loop.is_running():
-            ping_reset_loop.start()
+        if GUILD_ID:
+            guild_object = discord.Object(id=GUILD_ID)
 
-        # Guild sync prevents the global-command delay.
-        guild = discord.Object(id=GUILD_ID)
+            try:
+                synced = await self.tree.sync(guild=guild_object)
+                print(f"[SYNC] Synced {len(synced)} slash commands to guild {GUILD_ID}")
+                self.sync_done = True
+            except discord.Forbidden:
+                print("[ERROR] Slash command sync failed: Missing Access.")
+                print("[FIX] Check GUILD_ID and make sure the bot is installed in that server.")
+                print("[FIX] Reinstall the bot with both 'bot' and 'applications.commands' scopes.")
+            except discord.HTTPException as exc:
+                print(f"[ERROR] Slash command sync failed: {exc}")
+        else:
+            try:
+                synced = await self.tree.sync()
+                print(f"[SYNC] Synced {len(synced)} global slash commands.")
+                self.sync_done = True
+            except discord.HTTPException as exc:
+                print(f"[ERROR] Global slash command sync failed: {exc}")
 
-        try:
-            synced = await self.tree.sync(guild=guild)
-            print(f"Slash commands synced: {len(synced)}")
-        except discord.Forbidden:
-            print(
-                "\n[ERROR] Slash command sync failed: Missing Access.\n"
-                "Make sure the bot is in the configured guild and was "
-                "installed with applications.commands.\n"
-            )
-        except Exception as e:
-            print(f"[ERROR] Slash command sync failed: {e}")
+    async def on_ready(self):
+        print("--------------------------------")
+        print(f"{self.user} is Ready")
+        print(f"Guild ID: {GUILD_ID if GUILD_ID else 'Global'}")
+        print(f"Loaded slots: {db_one('SELECT COUNT(*) AS c FROM slots')['c']}")
+        print("--------------------------------")
+
+    @tasks.loop(seconds=30)
+    async def expiry_loop(self):
+        await self.process_slots()
+
+    @expiry_loop.before_loop
+    async def before_expiry_loop(self):
+        await self.wait_until_ready()
+
+    async def process_slots(self):
+        current = now_ts()
+        current_ist = ist_now()
+        noon = current_ist.replace(hour=12, minute=0, second=0, microsecond=0)
+        today = current_ist.strftime("%Y-%m-%d")
+
+        guilds = self.guilds
+
+        for guild in guilds:
+            slots = get_active_slots(guild.id)
+
+            for slot in slots:
+                # Daily @here/@everyone reset at 12:00 PM IST.
+                if current_ist >= noon and slot["last_reset_date"] != today:
+                    db_execute(
+                        """
+                        UPDATE slots
+                        SET here_count = 0,
+                            everyone_count = 0,
+                            last_reset_date = ?
+                        WHERE channel_id = ?
+                        """,
+                        (today, slot["channel_id"]),
+                    )
+
+                    slot = get_slot(int(slot["channel_id"]))
+
+                    channel = await get_text_channel(guild, int(slot["channel_id"]))
+                    if channel:
+                        role_id = (
+                            PREMIUM_ROLE_ID
+                            if slot["slot_type"] == "premium"
+                            else STANDARD_ROLE_ID
+                        )
+                        try:
+                            await channel.send(
+                                f"{role_mention(role_id)} pings have been resetted."
+                            )
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
+
+                # Expiry.
+                if slot["status"] == "active" and float(slot["expires_at"]) <= current:
+                    await revoke_slot(
+                        guild,
+                        slot,
+                        action="expired",
+                        reason="Slot expired.",
+                    )
+                    continue
+
+                # Time-to-time owner DMs.
+                if slot["status"] == "active":
+                    remaining = float(slot["expires_at"]) - current
+
+                    if remaining <= 86400 and not slot["notified_24h"]:
+                        owner = await get_member(guild, int(slot["owner_id"]))
+                        if owner:
+                            try:
+                                embed = status_embed(slot, owner, "active")
+                                embed.add_field(
+                                    name="Notice",
+                                    value="Your slot expires within 24 hours.",
+                                    inline=False,
+                                )
+                                await owner.send(
+                                    embed=embed,
+                                    view=renewal_view(int(slot["guild_id"]), int(slot["channel_id"])),
+                                )
+                            except (discord.Forbidden, discord.HTTPException):
+                                pass
+
+                        db_execute(
+                            "UPDATE slots SET notified_24h = 1 WHERE channel_id = ?",
+                            (slot["channel_id"],),
+                        )
+
+                    if remaining <= 3600 and not slot["notified_1h"]:
+                        owner = await get_member(guild, int(slot["owner_id"]))
+                        if owner:
+                            try:
+                                embed = status_embed(slot, owner, "active")
+                                embed.add_field(
+                                    name="Notice",
+                                    value="Your slot expires within 1 hour.",
+                                    inline=False,
+                                )
+                                await owner.send(
+                                    embed=embed,
+                                    view=renewal_view(int(slot["guild_id"]), int(slot["channel_id"])),
+                                )
+                            except (discord.Forbidden, discord.HTTPException):
+                                pass
+
+                        db_execute(
+                            "UPDATE slots SET notified_1h = 1 WHERE channel_id = ?",
+                            (slot["channel_id"],),
+                        )
 
 
 bot = CupicBot()
 
 
-# =========================================================
-# STORAGE
-# =========================================================
-
-def load_slots():
-    if not DATA_FILE.exists():
-        return []
-
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if not isinstance(data, list):
-            return []
-
-        return data
-
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-def save_slots(slots):
-    temp_file = DATA_FILE.with_suffix(".tmp")
-
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(slots, f, indent=4)
-
-    temp_file.replace(DATA_FILE)
-
-
-slots = load_slots()
-
-
-def get_slot(channel_id):
-    for slot in slots:
-        if int(slot["channel_id"]) == int(channel_id):
-            return slot
-
-    return None
-
-
-def get_user_slot(user_id):
-    for slot in slots:
-        if int(slot["user_id"]) == int(user_id):
-            return slot
-
-    return None
-
-
-# =========================================================
-# TIME HELPERS
-# =========================================================
-
-def now_timestamp():
-    return datetime.datetime.now(datetime.timezone.utc).timestamp()
-
-
-def format_duration(seconds):
-    seconds = max(0, int(seconds))
-
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-
-    if days:
-        return f"{days} Days"
-
-    if hours:
-        return f"{hours} Hours"
-
-    return f"{minutes} Minutes"
-
-
-def calculate_expiry(amount, unit):
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    unit = unit.lower()
-
-    if unit == "minutes":
-        delta = datetime.timedelta(minutes=amount)
-
-    elif unit == "hours":
-        delta = datetime.timedelta(hours=amount)
-
-    elif unit == "days":
-        delta = datetime.timedelta(days=amount)
-
-    elif unit == "months":
-        # Slot systems commonly treat a month as 30 days.
-        delta = datetime.timedelta(days=amount * 30)
-
-    else:
-        raise ValueError("Invalid time unit.")
-
-    return now.timestamp() + delta.total_seconds()
-
-
-def discord_timestamp(timestamp, style="R"):
-    return f"<t:{int(timestamp)}:{style}>"
-
-
-# =========================================================
-# EMBEDS
-# =========================================================
-
-def base_embed(title=None, color=EMBED_COLOR):
-    embed = discord.Embed(
-        title=title,
-        color=color
-    )
-
-    embed.set_footer(text=FOOTER)
-    return embed
-
-
-def error_embed(description):
-    return base_embed(
-        "Action Failed",
-        ERROR_COLOR
-    ).add_field(
-        name="",
-        value=description,
-        inline=False
-    )
-
-
-def success_embed(description):
-    return base_embed(
-        "Done",
-        SUCCESS_COLOR
-    ).add_field(
-        name="",
-        value=description,
-        inline=False
-    )
-
-
-def build_slot_embed(guild, member, slot):
-    created = float(slot["created_at"])
-    expiry = float(slot["end_time"])
-
-    remaining = max(0, expiry - now_timestamp())
-
-    embed = discord.Embed(
-        title="Cupic Slots",
-        color=EMBED_COLOR
-    )
-
-    embed.add_field(
-        name="Slot Information",
-        value="",
-        inline=False
-    )
-
-    embed.add_field(
-        name="User",
-        value=member.mention,
-        inline=False
-    )
-
-    embed.add_field(
-        name="Slot Name",
-        value=f"🌸 • {slot['slot_name']}",
-        inline=False
-    )
-
-    embed.add_field(
-        name="Type",
-        value=slot["slot_type"].capitalize(),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Duration",
-        value=format_duration(expiry - created),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Creation Date",
-        value=discord_timestamp(created),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Expiry Date",
-        value=discord_timestamp(expiry),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Remaining",
-        value=format_duration(remaining),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Ping Allowed",
-        value=(
-            f"`@here : {slot['here_limit']}`\n"
-            f"`@everyone : {slot['everyone_limit']}`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Ping Used",
-        value=(
-            f"`@here : {slot['here_used']}/{slot['here_limit']}`\n"
-            f"`@everyone : "
-            f"{slot['everyone_used']}/{slot['everyone_limit']}`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Slot Rules",
-        value=(
-            "📌 • Follow the server rules\n"
-            "📌 • Use only the allowed pings\n"
-            "📌 • Do not abuse the slot"
-        ),
-        inline=False
-    )
-
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=FOOTER)
-
-    return embed
-
-
-def build_rules_embed():
-    embed = discord.Embed(
-        title="Slot Rules",
-        color=EMBED_COLOR
-    )
-
-    embed.description = (
-        "📌 • Follow the server rules\n"
-        "📌 • Use only the allowed `@here` and `@everyone` pings\n"
-        "📌 • User and role mentions do not count as slot pings\n"
-        "📌 • Do not abuse or bypass the slot limits\n"
-        "📌 • Slot access is personal and cannot be shared\n"
-        "📌 • Excessive or unauthorized pings will revoke the slot"
-    )
-
-    embed.set_footer(text=FOOTER)
-
-    return embed
-
-
-# =========================================================
-# PERMISSION HELPERS
-# =========================================================
-
-def is_staff_or_admin(member: discord.Member):
-    if member.guild_permissions.administrator:
-        return True
-
-    return any(
-        role.id == STAFF_ROLE_ID
-        for role in member.roles
-    )
-
-
-def is_slot_owner(member, slot):
-    return int(slot["user_id"]) == int(member.id)
-
-
-# =========================================================
-# ROLE HELPERS
-# =========================================================
-
-async def get_role(guild, role_id):
-    role = guild.get_role(role_id)
-
-    if role:
-        return role
-
-    try:
-        return await guild.fetch_role(role_id)
-    except discord.HTTPException:
-        return None
-
-
-async def assign_slot_role(guild, member, slot_type):
-    premium = await get_role(guild, PREMIUM_ROLE_ID)
-    standard = await get_role(guild, STANDARD_ROLE_ID)
-
-    try:
-        if slot_type.lower() == "premium":
-            if premium:
-                await member.add_roles(premium, reason="Cupic slot created")
-
-            if standard and standard in member.roles:
-                await member.remove_roles(
-                    standard,
-                    reason="Premium slot assigned"
-                )
-
-        else:
-            if standard:
-                await member.add_roles(standard, reason="Cupic slot created")
-
-            if premium and premium in member.roles:
-                await member.remove_roles(
-                    premium,
-                    reason="Standard slot assigned"
-                )
-
-    except discord.HTTPException as e:
-        print(f"Role assignment error: {e}")
-
-
-async def remove_slot_roles(guild, member):
-    premium = await get_role(guild, PREMIUM_ROLE_ID)
-    standard = await get_role(guild, STANDARD_ROLE_ID)
-
-    try:
-        if premium and premium in member.roles:
-            await member.remove_roles(
-                premium,
-                reason="Cupic slot ended"
-            )
-
-        if standard and standard in member.roles:
-            await member.remove_roles(
-                standard,
-                reason="Cupic slot ended"
-            )
-
-    except discord.HTTPException as e:
-        print(f"Role removal error: {e}")
-
-
-# =========================================================
-# CHANNEL PERMISSIONS
-# =========================================================
-
-async def apply_slot_permissions(channel, guild, owner):
-    everyone = guild.default_role
-
-    staff_role = guild.get_role(STAFF_ROLE_ID)
-
-    overwrites = {
-        everyone: discord.PermissionOverwrite(
-            view_channel=False
-        ),
-
-        owner: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            mention_everyone=True
-        )
-    }
-
-    if staff_role:
-        overwrites[staff_role] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_messages=True,
-            mention_everyone=True
-        )
-
-    await channel.edit(overwrites=overwrites)
-
-
-# =========================================================
-# DM FUNCTIONS
-# =========================================================
-
-async def send_slot_dm(member, guild, slot, reason):
-    channel_id = int(slot["channel_id"])
-
-    view = discord.ui.View()
-
-    button = discord.ui.Button(
-        label="Click here to renew",
-        style=discord.ButtonStyle.link,
-        url=f"https://discord.com/channels/{guild.id}/{channel_id}"
-    )
-
-    view.add_item(button)
-
-    embed = discord.Embed(
-        title="Cupic Slots",
-        color=ERROR_COLOR
-    )
-
-    embed.description = (
-        f"Your **{slot['slot_name']}** slot in **{guild.name}** "
-        f"has been {reason}.\n\n"
-        f"**Reason:** {reason.capitalize()}."
-    )
-
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=FOOTER)
-
-    try:
-        await member.send(
-            embed=embed,
-            view=view
-        )
-    except discord.Forbidden:
-        print(f"Could not DM {member}.")
-
-
-# =========================================================
-# REVOKE / EXPIRE
-# =========================================================
-
-async def revoke_slot(guild, channel, slot, reason):
-    if slot not in slots:
-        return
-
-    try:
-        member = guild.get_member(int(slot["user_id"]))
-
-        # Delete the offending message is handled separately.
-        await channel.set_permissions(
-            member if member else guild.default_role,
-            send_messages=False
-        )
-
-        if member:
-            await remove_slot_roles(guild, member)
-
-        embed = discord.Embed(
-            title="Slot Revoked",
-            description=(
-                f"This slot has been revoked.\n\n"
-                f"**Reason:** {reason}"
-            ),
-            color=ERROR_COLOR
-        )
-
-        embed.set_footer(text=FOOTER)
-
-        await channel.send(embed=embed)
-
-        if member:
-            await send_slot_dm(
-                member,
-                guild,
-                slot,
-                "revoked"
-            )
-
-    except discord.HTTPException as e:
-        print(f"Revoke error: {e}")
-
-    try:
-        slots.remove(slot)
-        save_slots()
-    except ValueError:
-        pass
-
-
-async def expire_slot(guild, channel, slot):
-    if slot not in slots:
-        return
-
-    member = guild.get_member(int(slot["user_id"]))
-
-    try:
-        if member:
-            await remove_slot_roles(guild, member)
-
-        embed = discord.Embed(
-            title="Slot Expired",
-            description=(
-                "This slot has expired.\n\n"
-                f"**Expiry:** {discord_timestamp(slot['end_time'])}"
-            ),
-            color=WARNING_COLOR
-        )
-
-        embed.set_footer(text=FOOTER)
-
-        await channel.send(embed=embed)
-
-        if member:
-            await send_slot_dm(
-                member,
-                guild,
-                slot,
-                "expired"
-            )
-
-    except discord.HTTPException as e:
-        print(f"Expiry error: {e}")
-
-    slots.remove(slot)
-    save_slots()
-
-
-# =========================================================
-# BACKGROUND EXPIRY LOOP
-# =========================================================
-
-@tasks.loop(minutes=1)
-async def expiry_loop():
-    current = now_timestamp()
-
-    for slot in slots.copy():
-        if current >= float(slot["end_time"]):
-            guild = bot.get_guild(GUILD_ID)
-
-            if not guild:
-                continue
-
-            channel = guild.get_channel(
-                int(slot["channel_id"])
-            )
-
-            if channel:
-                await expire_slot(
-                    guild,
-                    channel,
-                    slot
-                )
-            else:
-                member = guild.get_member(
-                    int(slot["user_id"])
-                )
-
-                if member:
-                    await remove_slot_roles(
-                        guild,
-                        member
-                    )
-
-                slots.remove(slot)
-                save_slots()
-
-
-# =========================================================
-# 12 PM IST PING RESET
-# =========================================================
-
-last_reset_date = None
-
-
-@tasks.loop(minutes=1)
-async def ping_reset_loop():
-    global last_reset_date
-
-    now = datetime.datetime.now(IST)
-
-    # Exactly 12:00 PM IST.
-    if now.hour != 12 or now.minute != 0:
-        return
-
-    today = now.date()
-
-    if last_reset_date == today:
-        return
-
-    last_reset_date = today
-
-    guild = bot.get_guild(GUILD_ID)
-
-    if not guild:
-        return
-
-    for slot in slots.copy():
-
-        # Don't reset expired slots.
-        if now_timestamp() >= float(slot["end_time"]):
-            continue
-
-        slot["here_used"] = 0
-        slot["everyone_used"] = 0
-
-        channel = guild.get_channel(
-            int(slot["channel_id"])
-        )
-
-        if not channel:
-            continue
-
-        role_id = (
-            PREMIUM_ROLE_ID
-            if slot["slot_type"].lower() == "premium"
-            else STANDARD_ROLE_ID
-        )
-
-        role = guild.get_role(role_id)
-
-        if role:
-            try:
-                await channel.send(
-                    f"{role.mention} pings have been resetted."
-                )
-            except discord.HTTPException:
-                pass
-
-    save_slots()
-
-
-# =========================================================
-# MESSAGE HANDLER
-# =========================================================
+# ============================================================
+# MESSAGE / PING SYSTEM
+# ============================================================
 
 @bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
-
-    if not message.guild:
-        await bot.process_commands(message)
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
         return
 
     slot = get_slot(message.channel.id)
 
-    if slot:
-        # Only @here and @everyone count.
-        #
-        # A normal user mention:
-        # <@123>
-        #
-        # A role mention:
-        # <@&123>
-        #
-        # does NOT count.
-        #
-        # Discord sets mention_everyone for @here/@everyone.
+    if not slot:
+        return
 
-        if message.mention_everyone:
-            content = message.content
+    if slot["guild_id"] != message.guild.id:
+        return
 
-            has_here = "@here" in content
-            has_everyone = "@everyone" in content
+    # Only the actual slot owner consumes @here/@everyone allowance.
+    if message.author.id != int(slot["owner_id"]):
+        return
 
-            # Both can theoretically be present in one message.
-            # Count each according to its own limit.
-            if has_here:
-                slot["here_used"] += 1
+    if slot["status"] != "active":
+        return
 
-                if slot["here_limit"] == 0:
-                    await message.delete()
+    content = message.content
 
-                    await revoke_slot(
-                        message.guild,
-                        message.channel,
-                        slot,
-                        "Unauthorized @here ping"
-                    )
+    # Only @here and @everyone count.
+    has_here = "@here" in content
+    has_everyone = "@everyone" in content
 
-                    return
+    if not has_here and not has_everyone:
+        return
 
-                if slot["here_used"] > slot["here_limit"]:
-                    await message.delete()
+    new_here = int(slot["here_count"]) + (1 if has_here else 0)
+    new_everyone = int(slot["everyone_count"]) + (1 if has_everyone else 0)
 
-                    await revoke_slot(
-                        message.guild,
-                        message.channel,
-                        slot,
-                        "Excessive @here pings"
-                    )
+    here_bad = has_here and new_here > int(slot["here_limit"])
+    everyone_bad = has_everyone and new_everyone > int(slot["everyone_limit"])
 
-                    return
+    if here_bad or everyone_bad:
+        reasons = []
 
-                try:
-                    await message.channel.send(
-                        f"{slot['here_used']}/{slot['here_limit']}"
-                    )
-                except discord.HTTPException:
-                    pass
+        if here_bad:
+            reasons.append(
+                f"@here limit exceeded ({slot['here_limit']} allowed)"
+            )
 
-                save_slots()
+        if everyone_bad:
+            reasons.append(
+                f"@everyone limit exceeded ({slot['everyone_limit']} allowed)"
+            )
 
-            if has_everyone:
-                slot["everyone_used"] += 1
+        await revoke_slot(
+            message.guild,
+            slot,
+            action="revoked",
+            reason="; ".join(reasons),
+            delete_offending_message=message,
+        )
+        return
 
-                if slot["everyone_limit"] == 0:
-                    await message.delete()
+    db_execute(
+        """
+        UPDATE slots
+        SET here_count = ?, everyone_count = ?
+        WHERE channel_id = ?
+        """,
+        (new_here, new_everyone, message.channel.id),
+    )
 
-                    await revoke_slot(
-                        message.guild,
-                        message.channel,
-                        slot,
-                        "Unauthorized @everyone ping"
-                    )
+    # Do not create another @here/@everyone mention in the confirmation.
+    counters = []
 
-                    return
+    if has_here:
+        counters.append(f"`@here` • {new_here}/{slot['here_limit']}")
 
-                if slot["everyone_used"] > slot["everyone_limit"]:
-                    await message.delete()
+    if has_everyone:
+        counters.append(
+            f"`@everyone` • {new_everyone}/{slot['everyone_limit']}"
+        )
 
-                    await revoke_slot(
-                        message.guild,
-                        message.channel,
-                        slot,
-                        "Excessive @everyone pings"
-                    )
-
-                    return
-
-                try:
-                    await message.channel.send(
-                        f"{slot['everyone_used']}/"
-                        f"{slot['everyone_limit']}"
-                    )
-                except discord.HTTPException:
-                    pass
-
-                save_slots()
-
-    await bot.process_commands(message)
+    try:
+        await message.channel.send("  |  ".join(counters))
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
-# =========================================================
-# SLASH COMMAND CHECK
-# =========================================================
+# ============================================================
+# COMMAND HELPERS
+# ============================================================
 
-def staff_only():
-    async def predicate(interaction: discord.Interaction):
-        if not interaction.guild:
-            return False
+async def require_staff(interaction: discord.Interaction) -> bool:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return False
 
-        member = interaction.user
+    if not is_staff(interaction.user):
+        await interaction.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True,
+        )
+        return False
 
-        if not isinstance(member, discord.Member):
-            return False
-
-        return is_staff_or_admin(member)
-
-    return app_commands.check(predicate)
+    return True
 
 
-# =========================================================
-# /CREATE
-# =========================================================
+async def resolve_slot_from_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None,
+):
+    target = channel or interaction.channel
 
-@bot.tree.command(
-    name="create",
-    description="Create a new slot."
-)
+    if not isinstance(target, discord.TextChannel):
+        await interaction.response.send_message(
+            "Use this command in a slot channel or select a slot channel.",
+            ephemeral=True,
+        )
+        return None
+
+    slot = get_slot(target.id)
+
+    if not slot:
+        await interaction.response.send_message(
+            "Slot Not In DataBase",
+            ephemeral=True,
+        )
+        return None
+
+    return slot
+
+
+async def require_slot_access(
+    interaction: discord.Interaction,
+    slot,
+) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
+
+    if not can_manage_slot(interaction.user, slot):
+        await interaction.response.send_message(
+            "You do not have permission to use this command here.",
+            ephemeral=True,
+        )
+        return False
+
+    return True
+
+
+# ============================================================
+# SLASH COMMANDS
+# ============================================================
+
+@bot.tree.command(name="create", description="Create a new slot")
 @app_commands.describe(
     user="Slot owner",
-    time="Slot duration",
-    unit="Duration unit",
+    time="How long the slot should last",
+    unit_of_time="Time unit",
     slotname="Slot name",
     typeofslot="Premium or standard",
-    category="Category for the slot",
+    category="Category where the slot channel will be created",
     numberofpings="Allowed @here pings",
-    numberofeveryoneping="Allowed @everyone pings"
+    numberofeveryoneping="Allowed @everyone pings",
 )
 @app_commands.choices(
-    unit=[
+    unit_of_time=[
         app_commands.Choice(name="Minutes", value="minutes"),
         app_commands.Choice(name="Hours", value="hours"),
         app_commands.Choice(name="Days", value="days"),
         app_commands.Choice(name="Months", value="months"),
+        app_commands.Choice(name="Years", value="years"),
     ],
     typeofslot=[
         app_commands.Choice(name="Premium", value="premium"),
         app_commands.Choice(name="Standard", value="standard"),
-    ]
+    ],
 )
-@staff_only()
+@app_commands.rename(
+    unit_of_time="unit_of_time",
+    typeofslot="typeofslot",
+    numberofpings="numberofpings",
+    numberofeveryoneping="numberofeveryoneping",
+)
 async def create(
     interaction: discord.Interaction,
     user: discord.Member,
-    time: app_commands.Range[int, 1, 3650],
-    unit: app_commands.Choice[str],
+    time: app_commands.Range[int, 1, 36500],
+    unit_of_time: app_commands.Choice[str],
     slotname: str,
     typeofslot: app_commands.Choice[str],
     category: discord.CategoryChannel,
-    numberofpings: app_commands.Range[int, 0, 100],
-    numberofeveryoneping: app_commands.Range[int, 0, 100]
+    numberofpings: app_commands.Range[int, 0, 1000],
+    numberofeveryoneping: app_commands.Range[int, 0, 1000],
 ):
-    await interaction.response.defer(ephemeral=True)
+    if not await require_staff(interaction):
+        return
 
-    guild = interaction.guild
-
-    # Prevent duplicate active slots.
-    existing = get_user_slot(user.id)
-
-    if existing:
-        await interaction.followup.send(
-            embed=error_embed(
-                f"{user.mention} already has an active slot."
-            ),
-            ephemeral=True
+    if category.guild.id != interaction.guild.id:
+        await interaction.response.send_message(
+            "The category must be in this server.",
+            ephemeral=True,
         )
         return
 
-    end_time = calculate_expiry(
-        time,
-        unit.value
-    )
+    if len(slotname.strip()) < 1:
+        await interaction.response.send_message(
+            "Slot name cannot be empty.",
+            ephemeral=True,
+        )
+        return
 
     slot_type = typeofslot.value
+    role = role_for_type(interaction.guild, slot_type)
 
-    # Create basic permissions.
+    if not role:
+        await interaction.response.send_message(
+            "The configured slot role was not found.",
+            ephemeral=True,
+        )
+        return
+
+    me = interaction.guild.me
+    if me and role >= me.top_role and not me.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Move the Cupic Bot role above the slot owner roles.",
+            ephemeral=True,
+        )
+        return
+
+    if not me.guild_permissions.manage_channels:
+        await interaction.response.send_message(
+            "Cupic Bot needs Manage Channels.",
+            ephemeral=True,
+        )
+        return
+
+    if not me.guild_permissions.manage_roles and role not in user.roles:
+        await interaction.response.send_message(
+            "Cupic Bot needs Manage Roles.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    created_at = now_ts()
+    expires_at = created_at + duration_seconds(time, unit_of_time.value)
+    channel_name = safe_channel_name(slotname)
+
+    staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
+
     overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=False
+        interaction.guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            mention_everyone=False,
         ),
-
         user: discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
-            read_message_history=True,
-            mention_everyone=True
-        )
+            mention_everyone=True,
+        ),
     }
-
-    staff_role = guild.get_role(STAFF_ROLE_ID)
 
     if staff_role:
         overwrites[staff_role] = discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
-            read_message_history=True,
+            mention_everyone=True,
             manage_messages=True,
-            mention_everyone=True
         )
 
-    # Channel name.
-    safe_name = slotname.lower().replace(" ", "-")
-
-    channel = await guild.create_text_channel(
-        name=safe_name[:100],
-        category=category,
-        overwrites=overwrites,
-        reason=f"Cupic slot created by {interaction.user}"
-    )
-
-    slot = {
-        "channel_id": channel.id,
-        "user_id": user.id,
-        "slot_name": slotname,
-        "slot_type": slot_type,
-        "category_id": category.id,
-        "created_at": now_timestamp(),
-        "end_time": end_time,
-        "here_limit": numberofpings,
-        "everyone_limit": numberofeveryoneping,
-        "here_used": 0,
-        "everyone_used": 0
-    }
-
-    slots.append(slot)
-    save_slots()
-
-    # Assign standard/premium role.
-    await assign_slot_role(
-        guild,
-        user,
-        slot_type
-    )
-
-    # Main slot information.
-    await channel.send(
-        embed=build_slot_embed(
-            guild,
-            user,
-            slot
-        )
-    )
-
-    # Rules automatically follow details.
-    await channel.send(
-        embed=build_rules_embed()
-    )
-
-    await interaction.followup.send(
-        embed=success_embed(
-            f"Slot created successfully.\n"
-            f"**Channel:** {channel.mention}\n"
-            f"**Owner:** {user.mention}\n"
-            f"**Type:** {slot_type.capitalize()}"
-        ),
-        ephemeral=True
-    )
-
-
-# =========================================================
-# /SRULES
-# =========================================================
-
-@bot.tree.command(
-    name="srules",
-    description="Send slot rules in this channel."
-)
-@staff_only()
-async def srules(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        embed=build_rules_embed()
-    )
-
-
-# =========================================================
-# /SLOTINFO
-# =========================================================
-
-@bot.tree.command(
-    name="slotinfo",
-    description="Show information about this slot."
-)
-async def slotinfo(interaction: discord.Interaction):
-    slot = get_slot(interaction.channel_id)
-
-    if not slot:
-        await interaction.response.send_message(
-            embed=error_embed(
-                "This channel is not a registered slot."
-            ),
-            ephemeral=True
-        )
-        return
-
-    member = interaction.guild.get_member(
-        int(slot["user_id"])
-    )
-
-    if not member:
-        await interaction.response.send_message(
-            embed=error_embed(
-                "The slot owner could not be found."
-            ),
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message(
-        embed=build_slot_embed(
-            interaction.guild,
-            member,
-            slot
-        )
-    )
-
-
-# =========================================================
-# /HOLD
-# =========================================================
-
-@bot.tree.command(
-    name="hold",
-    description="Hold a slot."
-)
-@app_commands.describe(
-    channel="Slot channel"
-)
-@staff_only()
-async def hold(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
-    slot = get_slot(channel.id)
-
-    if not slot:
-        await interaction.response.send_message(
-            embed=error_embed(
-                "That channel is not a registered slot."
-            ),
-            ephemeral=True
-        )
-        return
-
-    owner = interaction.guild.get_member(
-        int(slot["user_id"])
-    )
-
-    if owner:
-        await channel.set_permissions(
-            owner,
-            send_messages=False
-        )
-
-    await interaction.response.send_message(
-        embed=success_embed(
-            f"Slot {channel.mention} has been put on hold."
-        ),
-        ephemeral=True
-    )
-
-
-# =========================================================
-# /UNHOLD
-# =========================================================
-
-@bot.tree.command(
-    name="unhold",
-    description="Remove the hold from a slot."
-)
-@app_commands.describe(
-    channel="Slot channel"
-)
-@staff_only()
-async def unhold(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
-    slot = get_slot(channel.id)
-
-    if not slot:
-        await interaction.response.send_message(
-            embed=error_embed(
-                "That channel is not a registered slot."
-            ),
-            ephemeral=True
-        )
-        return
-
-    owner = interaction.guild.get_member(
-        int(slot["user_id"])
-    )
-
-    if owner:
-        await channel.set_permissions(
-            owner,
+    # Make sure the bot itself can always work inside the private slot.
+    if me:
+        overwrites[me] = discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
-            read_message_history=True,
-            mention_everyone=True
+            mention_everyone=True,
+            manage_messages=True,
+            manage_channels=True,
         )
 
-    await interaction.response.send_message(
-        embed=success_embed(
-            f"Slot {channel.mention} is active again."
-        ),
-        ephemeral=True
-    )
-
-
-# =========================================================
-# /REVOKE
-# =========================================================
-
-@bot.tree.command(
-    name="revoke",
-    description="Revoke a slot."
-)
-@app_commands.describe(
-    channel="Slot channel",
-    reason="Reason for revoking"
-)
-@staff_only()
-async def revoke(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    reason: str = "Staff action"
-):
-    slot = get_slot(channel.id)
-
-    if not slot:
-        await interaction.response.send_message(
-            embed=error_embed(
-                "That channel is not a registered slot."
-            ),
-            ephemeral=True
+    try:
+        channel = await interaction.guild.create_text_channel(
+            channel_name,
+            category=category,
+            overwrites=overwrites,
+            reason=f"Cupic Slots: create {slotname}",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I could not create the slot. Check Manage Channels and the category permissions.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            f"I could not create the slot: {exc}",
+            ephemeral=True,
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    reset_marker = reset_marker_for_creation()
 
-    await revoke_slot(
-        interaction.guild,
-        channel,
-        slot,
-        reason
-    )
+    try:
+        db_execute(
+            """
+            INSERT INTO slots (
+                guild_id, channel_id, owner_id, slot_name, slot_type,
+                category_id, created_at, expires_at, duration_value,
+                duration_unit, here_limit, everyone_limit,
+                here_count, everyone_count, status, last_reset_date
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'active', ?)
+            """,
+            (
+                interaction.guild.id,
+                channel.id,
+                user.id,
+                slotname.strip(),
+                slot_type,
+                category.id,
+                created_at,
+                expires_at,
+                time,
+                unit_of_time.value,
+                numberofpings,
+                numberofeveryoneping,
+                reset_marker,
+            ),
+        )
+    except sqlite3.Error:
+        try:
+            await channel.delete(reason="Cupic Slots: database error")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        await interaction.followup.send(
+            "The slot could not be saved. No slot was created.",
+            ephemeral=True,
+        )
+        return
+
+    slot = get_slot(channel.id)
+
+    role_added = await add_slot_role(interaction.guild, user, slot_type)
+
+    # Details first, then rules.
+    try:
+        detail_message = await channel.send(
+            embed=details_embed(interaction.guild, user, slot)
+        )
+        rules_message = await channel.send(
+            embed=rules_embed(interaction.guild)
+        )
+
+        db_execute(
+            """
+            UPDATE slots
+            SET details_message_id = ?, rules_message_id = ?
+            WHERE channel_id = ?
+            """,
+            (detail_message.id, rules_message.id, channel.id),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    # Creation DM.
+    try:
+        embed = details_embed(interaction.guild, user, slot)
+        embed.add_field(
+            name="Notice",
+            value="Your slot has been created.",
+            inline=False,
+        )
+        await user.send(
+            embed=embed,
+            view=renewal_view(interaction.guild.id, channel.id),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    if not role_added:
+        role_note = "\nRole could not be added. Check role hierarchy."
+    else:
+        role_note = ""
 
     await interaction.followup.send(
-        embed=success_embed(
-            f"Slot {channel.mention} has been revoked."
-        ),
-        ephemeral=True
+        f"successfully Create Slot {channel.mention}{role_note}",
+        ephemeral=True,
     )
 
 
-# =========================================================
-# /RENEW
-# =========================================================
-
-@bot.tree.command(
-    name="renew",
-    description="Renew an existing slot."
-)
+@bot.tree.command(name="renew", description="Renew a slot from staff")
 @app_commands.describe(
     channel="Slot channel",
-    time="Additional duration",
-    unit="Duration unit"
+    time="New duration",
+    unit_of_time="Time unit",
 )
 @app_commands.choices(
-    unit=[
+    unit_of_time=[
         app_commands.Choice(name="Minutes", value="minutes"),
         app_commands.Choice(name="Hours", value="hours"),
         app_commands.Choice(name="Days", value="days"),
         app_commands.Choice(name="Months", value="months"),
+        app_commands.Choice(name="Years", value="years"),
     ]
 )
-@staff_only()
 async def renew(
     interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    time: app_commands.Range[int, 1, 3650],
-    unit: app_commands.Choice[str]
+    time: app_commands.Range[int, 1, 36500],
+    unit_of_time: app_commands.Choice[str],
+    channel: discord.TextChannel | None = None,
 ):
-    slot = get_slot(channel.id)
-
-    if not slot:
-        await interaction.response.send_message(
-            embed=error_embed(
-                "That channel is not a registered slot."
-            ),
-            ephemeral=True
-        )
+    if not await require_staff(interaction):
         return
 
-    additional = calculate_expiry(
-        time,
-        unit.value
-    ) - now_timestamp()
+    slot = await resolve_slot_from_command(interaction, channel)
+    if not slot:
+        return
 
-    current_expiry = float(slot["end_time"])
+    new_expiry = now_ts() + duration_seconds(time, unit_of_time.value)
 
-    # If already expired, renew from now.
-    if current_expiry < now_timestamp():
-        current_expiry = now_timestamp()
-
-    slot["end_time"] = current_expiry + additional
-
-    save_slots()
-
-    owner = interaction.guild.get_member(
-        int(slot["user_id"])
+    db_execute(
+        """
+        UPDATE slots
+        SET expires_at = ?,
+            duration_value = ?,
+            duration_unit = ?,
+            here_count = 0,
+            everyone_count = 0,
+            status = 'active',
+            notified_24h = 0,
+            notified_1h = 0,
+            last_reset_date = ?
+        WHERE channel_id = ?
+        """,
+        (
+            new_expiry,
+            time,
+            unit_of_time.value,
+            reset_marker_for_creation(),
+            slot["channel_id"],
+        ),
     )
+
+    slot = get_slot(int(slot["channel_id"]))
+    guild = interaction.guild
+    owner = await get_member(guild, int(slot["owner_id"]))
+    target_channel = await get_text_channel(guild, int(slot["channel_id"]))
 
     if owner:
-        await channel.set_permissions(
-            owner,
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            mention_everyone=True
-        )
+        await add_slot_role(guild, owner, slot["slot_type"])
 
-        await assign_slot_role(
+    if owner and target_channel:
+        await set_owner_access(target_channel, owner, True)
+
+    await refresh_details_message(guild, slot)
+
+    await interaction.response.send_message(
+        f"successfully renew Slot {target_channel.mention if target_channel else ''}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="hold", description="Hold a slot")
+@app_commands.describe(channel="Slot channel")
+async def hold(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+):
+    if not await require_staff(interaction):
+        return
+
+    slot = await resolve_slot_from_command(interaction, channel)
+    if not slot:
+        return
+
+    if slot["status"] not in ("active", "held"):
+        await interaction.response.send_message(
+            "This slot is not active.",
+            ephemeral=True,
+        )
+        return
+
+    db_execute(
+        "UPDATE slots SET status = 'held' WHERE channel_id = ?",
+        (slot["channel_id"],),
+    )
+
+    slot = get_slot(int(slot["channel_id"]))
+    target = await get_text_channel(interaction.guild, int(slot["channel_id"]))
+    owner = await get_member(interaction.guild, int(slot["owner_id"]))
+
+    if owner and target:
+        await set_owner_access(target, owner, False)
+        await remove_slot_role_if_unused(
             interaction.guild,
             owner,
-            slot["slot_type"]
+            slot["slot_type"],
+            int(slot["channel_id"]),
         )
 
-    await channel.send(
-        embed=build_slot_embed(
-            interaction.guild,
-            owner,
-            slot
+    await interaction.response.send_message(
+        "successfully hold Slot",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="unhold", description="Unhold a slot")
+@app_commands.describe(channel="Slot channel")
+async def unhold(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+):
+    if not await require_staff(interaction):
+        return
+
+    slot = await resolve_slot_from_command(interaction, channel)
+    if not slot:
+        return
+
+    if slot["status"] != "held":
+        await interaction.response.send_message(
+            "This slot is not held.",
+            ephemeral=True,
         )
+        return
+
+    if float(slot["expires_at"]) <= now_ts():
+        await revoke_slot(
+            interaction.guild,
+            slot,
+            action="expired",
+            reason="Slot expired while it was held.",
+        )
+        await interaction.response.send_message(
+            "This slot has already expired.",
+            ephemeral=True,
+        )
+        return
+
+    db_execute(
+        """
+        UPDATE slots
+        SET status = 'active',
+            here_count = 0,
+            everyone_count = 0
+        WHERE channel_id = ?
+        """,
+        (slot["channel_id"],),
+    )
+
+    slot = get_slot(int(slot["channel_id"]))
+    owner = await get_member(interaction.guild, int(slot["owner_id"]))
+    target = await get_text_channel(interaction.guild, int(slot["channel_id"]))
+
+    if owner:
+        await add_slot_role(interaction.guild, owner, slot["slot_type"])
+
+    if owner and target:
+        await set_owner_access(target, owner, True)
+
+    await refresh_details_message(interaction.guild, slot)
+
+    await interaction.response.send_message(
+        "successfully unhold Slot",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="revoke", description="Revoke a slot")
+@app_commands.describe(channel="Slot channel")
+async def revoke(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+):
+    if not await require_staff(interaction):
+        return
+
+    slot = await resolve_slot_from_command(interaction, channel)
+    if not slot:
+        return
+
+    await revoke_slot(
+        interaction.guild,
+        slot,
+        action="revoked",
+        reason="Slot revoked by staff.",
     )
 
     await interaction.response.send_message(
-        embed=success_embed(
-            f"Slot {channel.mention} has been renewed."
-        ),
-        ephemeral=True
+        "successfully revoked Slot",
+        ephemeral=True,
     )
 
 
-# =========================================================
-# /ADD
-# =========================================================
+@bot.tree.command(name="srules", description="Send slot rules")
+async def srules(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Use this command inside a slot channel.",
+            ephemeral=True,
+        )
+        return
 
-@bot.tree.command(
-    name="add",
-    description="Give a member access to a slot."
-)
-@app_commands.describe(
-    channel="Slot channel",
-    user="Member to add"
-)
-@staff_only()
-async def add(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    user: discord.Member
-):
-    slot = get_slot(channel.id)
+    slot = get_slot(interaction.channel.id)
 
     if not slot:
         await interaction.response.send_message(
-            embed=error_embed(
-                "That channel is not a registered slot."
-            ),
-            ephemeral=True
+            "Slot Not In DataBase",
+            ephemeral=True,
         )
         return
 
-    await channel.set_permissions(
-        user,
-        view_channel=True,
-        send_messages=True,
-        read_message_history=True,
-        mention_everyone=True
-    )
+    if not await require_slot_access(interaction, slot):
+        return
 
+    await interaction.channel.send(embed=rules_embed(interaction.guild))
     await interaction.response.send_message(
-        embed=success_embed(
-            f"{user.mention} was added to {channel.mention}."
-        ),
-        ephemeral=True
+        "Slot rules sent.",
+        ephemeral=True,
     )
 
 
-# =========================================================
-# /REMOVE
-# =========================================================
-
-@bot.tree.command(
-    name="remove",
-    description="Remove a member from a slot."
-)
-@app_commands.describe(
-    channel="Slot channel",
-    user="Member to remove"
-)
-@staff_only()
-async def remove(
+@bot.tree.command(name="slotinfo", description="Show slot information")
+@app_commands.describe(channel="Slot channel")
+async def slotinfo(
     interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    user: discord.Member
+    channel: discord.TextChannel | None = None,
 ):
-    slot = get_slot(channel.id)
+    target = channel or interaction.channel
+
+    if not isinstance(target, discord.TextChannel):
+        await interaction.response.send_message(
+            "Use this command in a slot channel.",
+            ephemeral=True,
+        )
+        return
+
+    slot = get_slot(target.id)
 
     if not slot:
         await interaction.response.send_message(
-            embed=error_embed(
-                "That channel is not a registered slot."
-            ),
-            ephemeral=True
+            "Slot Not In DataBase",
+            ephemeral=True,
         )
         return
 
-    # Never accidentally remove the actual owner.
-    if int(slot["user_id"]) == user.id:
+    if not await require_slot_access(interaction, slot):
+        return
+
+    owner = await get_member(interaction.guild, int(slot["owner_id"]))
+
+    if not owner:
         await interaction.response.send_message(
-            embed=error_embed(
-                "You cannot remove the slot owner."
-            ),
-            ephemeral=True
+            "Slot owner could not be found.",
+            ephemeral=True,
         )
         return
-
-    await channel.set_permissions(
-        user,
-        overwrite=None
-    )
 
     await interaction.response.send_message(
-        embed=success_embed(
-            f"{user.mention} was removed from {channel.mention}."
-        ),
-        ephemeral=True
+        embed=details_embed(interaction.guild, owner, slot),
+        ephemeral=True,
     )
 
 
-# =========================================================
-# /PINGS
-# =========================================================
-
-@bot.tree.command(
-    name="pings",
-    description="Reset all active slot ping counters."
-)
-@staff_only()
+@bot.tree.command(name="pings", description="Reset all slot pings")
 async def pings(interaction: discord.Interaction):
-    guild = interaction.guild
-    count = 0
+    if not await require_staff(interaction):
+        return
 
-    for slot in slots:
-        if now_timestamp() >= float(slot["end_time"]):
-            continue
+    today = ist_now().strftime("%Y-%m-%d")
 
-        slot["here_used"] = 0
-        slot["everyone_used"] = 0
-
-        channel = guild.get_channel(
-            int(slot["channel_id"])
-        )
-
-        if channel:
-            role_id = (
-                PREMIUM_ROLE_ID
-                if slot["slot_type"].lower() == "premium"
-                else STANDARD_ROLE_ID
-            )
-
-            role = guild.get_role(role_id)
-
-            if role:
-                try:
-                    await channel.send(
-                        f"{role.mention} pings have been resetted."
-                    )
-                except discord.HTTPException:
-                    pass
-
-            count += 1
-
-    save_slots()
+    db_execute(
+        """
+        UPDATE slots
+        SET here_count = 0,
+            everyone_count = 0,
+            last_reset_date = ?
+        WHERE guild_id = ?
+          AND status = 'active'
+        """,
+        (today, interaction.guild.id),
+    )
 
     await interaction.response.send_message(
-        embed=success_embed(
-            f"Ping counters have been reset for **{count}** active slots."
-        ),
-        ephemeral=True
+        f"{role_mention(STANDARD_ROLE_ID)} {role_mention(PREMIUM_ROLE_ID)} "
+        "pings have been resetted."
     )
 
 
-# =========================================================
-# /HELP
-# =========================================================
-
-@bot.tree.command(
-    name="help",
-    description="Show available Cupic commands."
-)
+@bot.tree.command(name="help", description="Show Cupic Slots commands")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="Cupic Bot",
-        description="Slot management commands.",
-        color=EMBED_COLOR
-    )
-
-    embed.add_field(
-        name="General",
-        value=(
+        title="Cupic Slots",
+        description=(
+            "**Slot Commands**\n"
             "`/help` — Show this menu\n"
             "`/slotinfo` — View slot information\n"
-            "`/srules` — View slot rules"
+            "`/srules` — Send slot rules\n\n"
+            "**Staff Commands**\n"
+            "`/create` — Create a slot\n"
+            "`/renew` — Renew a slot\n"
+            "`/hold` — Hold a slot\n"
+            "`/unhold` — Unhold a slot\n"
+            "`/revoke` — Revoke a slot\n"
+            "`/pings` — Reset slot pings"
         ),
-        inline=False
+        color=discord.Color.from_rgb(255, 92, 172),
     )
-
-    if isinstance(interaction.user, discord.Member):
-        if is_staff_or_admin(interaction.user):
-            embed.add_field(
-                name="Staff",
-                value=(
-                    "`/create` — Create a slot\n"
-                    "`/renew` — Renew a slot\n"
-                    "`/hold` — Hold a slot\n"
-                    "`/unhold` — Unhold a slot\n"
-                    "`/revoke` — Revoke a slot\n"
-                    "`/add` — Add slot access\n"
-                    "`/remove` — Remove slot access\n"
-                    "`/pings` — Reset ping counters"
-                ),
-                inline=False
-            )
-
-    embed.set_footer(text=FOOTER)
-
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
-    )
+    embed.set_footer(text="Cupic Bot")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# =========================================================
-# ERROR HANDLER
-# =========================================================
-
-@bot.tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError
-):
-    if isinstance(error, app_commands.CheckFailure):
-        message = "You do not have permission to use this command."
-
-    elif isinstance(error, app_commands.CommandOnCooldown):
-        message = "Please wait before using this command again."
-
-    elif isinstance(error, app_commands.TransformerError):
-        message = "One of the provided values is invalid."
-
-    else:
-        print(
-            f"[COMMAND ERROR] "
-            f"{type(error).__name__}: {error}"
-        )
-
-        message = "Something went wrong while running this command."
-
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                embed=error_embed(message),
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                embed=error_embed(message),
-                ephemeral=True
-            )
-
-    except discord.HTTPException:
-        pass
-
-
-# =========================================================
-# READY
-# =========================================================
-
-@bot.event
-async def on_ready():
-    print("--------------------------------")
-    print(f"{bot.user} is Ready")
-    print(f"Guild ID: {GUILD_ID}")
-    print(f"Loaded slots: {len(slots)}")
-    print("--------------------------------")
-
-
-# =========================================================
+# ============================================================
 # START
-# =========================================================
+# ============================================================
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-if not TOKEN:
-    raise RuntimeError(
-        "DISCORD_TOKEN environment variable is missing."
-    )
-
-bot.run(TOKEN)
+if __name__ == "__main__":
+    bot.run(TOKEN)
